@@ -697,6 +697,7 @@ impl SettingsObserver {
             None => proto::LocalSettingsKind::Settings,
         };
         let path = RelPath::from_proto(&envelope.payload.path)?;
+        dbg!("got update worktree settings", &path);
         this.update(&mut cx, |this, cx| {
             let worktree_id = WorktreeId::from_proto(envelope.payload.worktree_id);
             let Some(worktree) = this
