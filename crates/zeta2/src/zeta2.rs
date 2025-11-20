@@ -43,6 +43,7 @@ use util::{LogErrorFuture, ResultExt as _, TryFutureExt};
 use workspace::notifications::{ErrorMessagePrompt, NotificationId, show_app_notification};
 
 pub mod assemble_excerpts;
+mod jump;
 mod prediction;
 mod provider;
 pub mod retrieval_search;
@@ -761,7 +762,7 @@ impl Zeta {
                 self.request_prediction_with_zed_cloud(project, active_buffer, position, cx)
             }
             ZetaEditPredictionModel::Sweep => {
-                self.request_prediction_with_sweep(project, active_buffer, position, cx)
+                self.request_prediction_with_sweep(project, active_buffer, position, true, cx)
             }
         }
     }
@@ -769,11 +770,12 @@ impl Zeta {
     fn request_prediction_with_sweep(
         &mut self,
         project: &Entity<Project>,
-        active_buffer: &Entity<Buffer>,
+        target_buffer: &Entity<Buffer>,
         position: language::Anchor,
+        allow_jump: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<EditPrediction>>> {
-        let snapshot = active_buffer.read(cx).snapshot();
+        let snapshot = target_buffer.read(cx).snapshot();
         let debug_info = self.sweep_ai_debug_info.clone();
         let Some(api_token) = self.sweep_api_token.clone() else {
             return Task::ready(Ok(None));
@@ -799,7 +801,7 @@ impl Zeta {
         let recent_buffer_snapshots = recent_buffers
             .filter_map(|project_path| {
                 let buffer = project.read(cx).get_open_buffer(&project_path, cx)?;
-                if active_buffer == &buffer {
+                if target_buffer == &buffer {
                     None
                 } else {
                     Some(buffer.read(cx).snapshot())
@@ -808,119 +810,153 @@ impl Zeta {
             .take(3)
             .collect::<Vec<_>>();
 
-        let result = cx.background_spawn(async move {
-            let text = snapshot.text();
+        let result = cx.background_spawn({
+            let full_path = full_path.clone();
+            let snapshot = snapshot.clone();
+            // todo!
+            let events = events.clone();
+            async move {
+                let text = snapshot.text();
 
-            let mut recent_changes = String::new();
-            for event in events {
-                sweep_ai::write_event(event, &mut recent_changes).unwrap();
+                let mut recent_changes = String::new();
+                for event in events {
+                    sweep_ai::write_event(event, &mut recent_changes).unwrap();
+                }
+
+                let file_chunks = recent_buffer_snapshots
+                    .into_iter()
+                    .map(|snapshot| {
+                        let end_point = language::Point::new(30, 0).min(snapshot.max_point());
+                        sweep_ai::FileChunk {
+                            content: snapshot
+                                .text_for_range(language::Point::zero()..end_point)
+                                .collect(),
+                            file_path: snapshot
+                                .file()
+                                .map(|f| f.path().as_unix_str())
+                                .unwrap_or("untitled")
+                                .to_string(),
+                            start_line: 0,
+                            end_line: end_point.row as usize,
+                            timestamp: snapshot.file().and_then(|file| {
+                                Some(
+                                    file.disk_state()
+                                        .mtime()?
+                                        .to_seconds_and_nanos_for_persistence()?
+                                        .0,
+                                )
+                            }),
+                        }
+                    })
+                    .collect();
+
+                let request_body = sweep_ai::AutocompleteRequest {
+                    debug_info,
+                    repo_name,
+                    file_path: full_path.clone(),
+                    file_contents: text.clone(),
+                    original_file_contents: text,
+                    cursor_position: offset,
+                    recent_changes: recent_changes.clone(),
+                    changes_above_cursor: true,
+                    multiple_suggestions: false,
+                    branch: None,
+                    file_chunks,
+                    retrieval_chunks: vec![],
+                    recent_user_actions: vec![],
+                    // TODO
+                    privacy_mode_enabled: false,
+                };
+
+                let mut buf: Vec<u8> = Vec::new();
+                let writer = brotli::CompressorWriter::new(&mut buf, 4096, 11, 22);
+                serde_json::to_writer(writer, &request_body)?;
+                let body: AsyncBody = buf.into();
+
+                const SWEEP_API_URL: &str =
+                    "https://autocomplete.sweep.dev/backend/next_edit_autocomplete";
+
+                let request = http_client::Request::builder()
+                    .uri(SWEEP_API_URL)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", api_token))
+                    .header("Connection", "keep-alive")
+                    .header("Content-Encoding", "br")
+                    .method(Method::POST)
+                    .body(body)?;
+
+                let mut response = http_client.send(request).await?;
+
+                let mut body: Vec<u8> = Vec::new();
+                response.body_mut().read_to_end(&mut body).await?;
+
+                if !response.status().is_success() {
+                    anyhow::bail!(
+                        "Request failed with status: {:?}\nBody: {}",
+                        response.status(),
+                        String::from_utf8_lossy(&body),
+                    );
+                };
+
+                let response: sweep_ai::AutocompleteResponse = serde_json::from_slice(&body)?;
+
+                let old_text = snapshot
+                    .text_for_range(response.start_index..response.end_index)
+                    .collect::<String>();
+                let edits = language::text_diff(&old_text, &response.completion)
+                    .into_iter()
+                    .map(|(range, text)| {
+                        (
+                            snapshot.anchor_after(response.start_index + range.start)
+                                ..snapshot.anchor_before(response.start_index + range.end),
+                            text,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                anyhow::Ok((response.autocomplete_id, edits, snapshot))
             }
-
-            let file_chunks = recent_buffer_snapshots
-                .into_iter()
-                .map(|snapshot| {
-                    let end_point = language::Point::new(30, 0).min(snapshot.max_point());
-                    sweep_ai::FileChunk {
-                        content: snapshot
-                            .text_for_range(language::Point::zero()..end_point)
-                            .collect(),
-                        file_path: snapshot
-                            .file()
-                            .map(|f| f.path().as_unix_str())
-                            .unwrap_or("untitled")
-                            .to_string(),
-                        start_line: 0,
-                        end_line: end_point.row as usize,
-                        timestamp: snapshot.file().and_then(|file| {
-                            Some(
-                                file.disk_state()
-                                    .mtime()?
-                                    .to_seconds_and_nanos_for_persistence()?
-                                    .0,
-                            )
-                        }),
-                    }
-                })
-                .collect();
-
-            let request_body = sweep_ai::AutocompleteRequest {
-                debug_info,
-                repo_name,
-                file_path: full_path.clone(),
-                file_contents: text.clone(),
-                original_file_contents: text,
-                cursor_position: offset,
-                recent_changes: recent_changes.clone(),
-                changes_above_cursor: true,
-                multiple_suggestions: false,
-                branch: None,
-                file_chunks,
-                retrieval_chunks: vec![],
-                recent_user_actions: vec![],
-                // TODO
-                privacy_mode_enabled: false,
-            };
-
-            let mut buf: Vec<u8> = Vec::new();
-            let writer = brotli::CompressorWriter::new(&mut buf, 4096, 11, 22);
-            serde_json::to_writer(writer, &request_body)?;
-            let body: AsyncBody = buf.into();
-
-            const SWEEP_API_URL: &str =
-                "https://autocomplete.sweep.dev/backend/next_edit_autocomplete";
-
-            let request = http_client::Request::builder()
-                .uri(SWEEP_API_URL)
-                .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", api_token))
-                .header("Connection", "keep-alive")
-                .header("Content-Encoding", "br")
-                .method(Method::POST)
-                .body(body)?;
-
-            let mut response = http_client.send(request).await?;
-
-            let mut body: Vec<u8> = Vec::new();
-            response.body_mut().read_to_end(&mut body).await?;
-
-            if !response.status().is_success() {
-                anyhow::bail!(
-                    "Request failed with status: {:?}\nBody: {}",
-                    response.status(),
-                    String::from_utf8_lossy(&body),
-                );
-            };
-
-            let response: sweep_ai::AutocompleteResponse = serde_json::from_slice(&body)?;
-
-            let old_text = snapshot
-                .text_for_range(response.start_index..response.end_index)
-                .collect::<String>();
-            let edits = language::text_diff(&old_text, &response.completion)
-                .into_iter()
-                .map(|(range, text)| {
-                    (
-                        snapshot.anchor_after(response.start_index + range.start)
-                            ..snapshot.anchor_before(response.start_index + range.end),
-                        text,
-                    )
-                })
-                .collect::<Vec<_>>();
-
-            anyhow::Ok((response.autocomplete_id, edits, snapshot))
         });
 
-        let buffer = active_buffer.clone();
+        let target_buffer = target_buffer.clone();
+        let http_client = cx.http_client();
+        let project = project.clone();
 
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let (id, edits, old_snapshot) = result.await?;
 
-            if edits.is_empty() {
+            if edits.is_empty() && !events.is_empty() && allow_jump {
+                let cursor_point = position.to_point(&snapshot);
+                let jump_result = jump::predict_jump(
+                    full_path,
+                    snapshot,
+                    cursor_point,
+                    events,
+                    project.clone(),
+                    http_client,
+                    cx,
+                )
+                .await?;
+
+                if let Some(jump) = jump_result {
+                    return this
+                        .update(cx, |this, cx| {
+                            this.request_prediction_with_sweep(
+                                &project,
+                                &jump.buffer,
+                                jump.anchor,
+                                allow_jump,
+                                cx,
+                            )
+                        })?
+                        .await;
+                }
+
                 return anyhow::Ok(None);
             }
 
             let Some((edits, new_snapshot, preview_task)) =
-                buffer.read_with(cx, |buffer, cx| {
+                target_buffer.read_with(cx, |buffer, cx| {
                     let new_snapshot = buffer.snapshot();
 
                     let edits: Arc<[(Range<Anchor>, Arc<str>)]> =
@@ -939,7 +975,7 @@ impl Zeta {
                 edits,
                 snapshot: new_snapshot,
                 edit_preview: preview_task.await,
-                buffer,
+                buffer: target_buffer,
             };
 
             anyhow::Ok(Some(prediction))
