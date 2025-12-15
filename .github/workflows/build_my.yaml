@@ -1,67 +1,93 @@
-name: Build Zed Release
+name: Build Zed macOS (Intel)
 
 on:
-  # 允许在 Actions 页面手动触发构建
-  workflow_dispatch:
-  # 当推送到 main 分支时自动触发 (可选，建议先注释掉，以免频繁构建耗尽额度)
-  # push:
-  #   branches: [ "main" ]
+  workflow_dispatch:  # 允许手动触发
+  push:
+    tags:
+      - "v*"         # 允许打 tag 触发
 
 env:
   CARGO_TERM_COLOR: always
-  # 减少构建缓存大小，加快速度
-  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+  # 显式告诉 Cargo 我们要构建 Intel 版本
+  # 虽然在 Intel 机器上这是默认值，但写上更保险
+  CARGO_BUILD_TARGET: x86_64-apple-darwin
 
 jobs:
-  build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # Zed 主要支持 macOS 和 Linux，这里配置两个矩阵
-        os: [ubuntu-latest, macos-latest]
+  build-intel:
+    name: Build Intel Release
+    # 关键点：macos-13 是 GitHub Actions 目前提供的 x86_64 (Intel) 架构环境
+    # 不要使用 macos-latest (它是 ARM/M1 架构)
+    runs-on: macos-13
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Zed 的构建过程依赖 Node.js (用于处理 copilot/语言服务器等逻辑)
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          targets: x86_64-apple-darwin
           components: rust-src
 
-      - name: Cache Cargo registry and target
+      - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      # Linux 特有的依赖安装 (Zed 需要 Vulkan, Wayland, Alsa 等库)
-      - name: Install Linux Dependencies
-        if: runner.os == 'Linux'
+      # 开始编译
+      - name: Build Release Binary
+        run: cargo build --release --target x86_64-apple-darwin
+
+      # 手动打包步骤：模拟官方打包结构，但跳过签名
+      - name: Create App Bundle
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libssl-dev libfreetype6-dev libexpat1-dev libxcb-composite0-dev libd3d12-0-dev libvulkan-dev
-          # Zed 在 Linux 上可能还需要特定的 link设置，通常上述依赖已足够基础构建
+          echo "Creating Zed.app structure..."
+          APP_NAME="Zed.app"
+          mkdir -p "$APP_NAME/Contents/MacOS"
+          mkdir -p "$APP_NAME/Contents/Resources"
 
-      # 编译 Release 版本
-      - name: Build Release
-        run: cargo build --release
+          echo "Copying Binary..."
+          cp target/x86_64-apple-darwin/release/zed "$APP_NAME/Contents/MacOS/zed"
 
-      # 重命名二进制文件以便区分 OS (可选)
-      - name: Rename Binary (Linux)
-        if: runner.os == 'Linux'
-        run: mv target/release/zed target/release/zed-linux
+          echo "Copying Resources (Icons and Plist)..."
+          # 尝试从源码目录复制官方的图标和配置 (路径可能会随官方版本变动，这里使用常见路径)
+          # 如果源码里没有找到，脚本不会报错退出，保证你能拿到二进制
+          cp crates/zed/resources/app-icon.icns "$APP_NAME/Contents/Resources/" || echo "Icon not found, skipping"
+          cp crates/zed/resources/Info.plist "$APP_NAME/Contents/" || echo "Plist not found, skipping"
 
-      - name: Rename Binary (macOS)
-        if: runner.os == 'macOS'
-        run: mv target/release/zed target/release/zed-macos
+          # 赋予可执行权限
+          chmod +x "$APP_NAME/Contents/MacOS/zed"
 
-      # 上传构建产物
-      - name: Upload Artifact
+          # 移除隔离属性 (虽然在 CI 环境可能没用，但为了保险)
+          xattr -c "$APP_NAME" || true
+
+      # 创建 DMG 镜像 (使用 create-dmg 工具，比手动 zip 更像 Release 包)
+      - name: Create DMG
+        run: |
+          npm install -g create-dmg
+          # 生成 Zed.dmg
+          create-dmg \
+            --overwrite \
+            --volname "Zed" \
+            --window-pos 200 120 \
+            --window-size 800 400 \
+            --icon-size 100 \
+            --icon "Zed.app" 200 190 \
+            --hide-extension "Zed.app" \
+            --app-drop-link 600 185 \
+            "Zed-Intel.dmg" \
+            "Zed.app"
+
+      # 上传构建产物：同时上传 .app (zip) 和 .dmg
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zed-build-${{ matrix.os }}
+          name: Zed-macOS-Intel
           path: |
-            target/release/zed-linux
-            target/release/zed-macos
-          retention-days: 5
+            Zed-Intel.dmg
+            Zed.app
