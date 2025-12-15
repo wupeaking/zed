@@ -8,14 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # 强制指定构建目标为 Intel 架构 (即使 Runner 是 ARM 的)
   CARGO_BUILD_TARGET: x86_64-apple-darwin
 
 jobs:
   build-intel-on-arm:
     name: Build Intel Release (Cross-compile)
-    # 使用最新的 macOS Runner (基于 Apple Silicon)
-    # 这样避免了 macos-13 的废弃警告，且编译速度通常更快
     runs-on: macos-latest
 
     steps:
@@ -31,25 +28,24 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          # 关键：安装 Intel 架构的标准库
-          targets: x86_64-apple-darwin
           components: rust-src
+
+      # [修正点]：显式手动安装 Intel 架构支持库
+      # 这是解决 "can't find crate for std" 的核心步骤
+      - name: Add Intel Target
+        run: rustup target add x86_64-apple-darwin
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      # 编译步骤
       - name: Build Release Binary (Intel)
-        # --target 参数告诉 Rust：虽然我在 ARM 机器上，但请给我生成 Intel 的包
         run: cargo build --release --target x86_64-apple-darwin
 
-      # 验证步骤 (可选，用于确认生成的文件格式正确)
       - name: Verify Architecture
         run: |
+          # 检查编译出来的文件是不是 Intel 架构 (x86_64)
           file target/x86_64-apple-darwin/release/zed
-          # 应该输出: Mach-O 64-bit executable x86_64
 
-      # 打包步骤
       - name: Create App Bundle
         run: |
           echo "Creating Zed.app structure..."
@@ -61,15 +57,10 @@ jobs:
           cp target/x86_64-apple-darwin/release/zed "$APP_NAME/Contents/MacOS/zed"
 
           echo "Copying Resources..."
-          # 尝试复制图标和 plist，如果找不到则忽略（不中断流程）
           cp crates/zed/resources/app-icon.icns "$APP_NAME/Contents/Resources/" || echo "Icon not found"
           cp crates/zed/resources/Info.plist "$APP_NAME/Contents/" || echo "Plist not found"
           
-          # 确保 Plist 里没有特定于 ARM 的设置 (通常通用，但为了保险)
-          # 赋予执行权限
           chmod +x "$APP_NAME/Contents/MacOS/zed"
-          
-          # 清除属性
           xattr -c "$APP_NAME" || true
 
       - name: Create DMG
