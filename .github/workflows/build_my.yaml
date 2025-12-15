@@ -1,0 +1,67 @@
+name: Build Zed Release
+
+on:
+  # 允许在 Actions 页面手动触发构建
+  workflow_dispatch:
+  # 当推送到 main 分支时自动触发 (可选，建议先注释掉，以免频繁构建耗尽额度)
+  # push:
+  #   branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  # 减少构建缓存大小，加快速度
+  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Zed 主要支持 macOS 和 Linux，这里配置两个矩阵
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rust-src
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      # Linux 特有的依赖安装 (Zed 需要 Vulkan, Wayland, Alsa 等库)
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libssl-dev libfreetype6-dev libexpat1-dev libxcb-composite0-dev libd3d12-0-dev libvulkan-dev
+          # Zed 在 Linux 上可能还需要特定的 link设置，通常上述依赖已足够基础构建
+
+      # 编译 Release 版本
+      - name: Build Release
+        run: cargo build --release
+
+      # 重命名二进制文件以便区分 OS (可选)
+      - name: Rename Binary (Linux)
+        if: runner.os == 'Linux'
+        run: mv target/release/zed target/release/zed-linux
+
+      - name: Rename Binary (macOS)
+        if: runner.os == 'macOS'
+        run: mv target/release/zed target/release/zed-macos
+
+      # 上传构建产物
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-build-${{ matrix.os }}
+          path: |
+            target/release/zed-linux
+            target/release/zed-macos
+          retention-days: 5
