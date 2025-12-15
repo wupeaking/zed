@@ -1,29 +1,27 @@
 name: Build Zed macOS (Intel)
 
 on:
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
   push:
     tags:
-      - "v*"         # 允许打 tag 触发
+      - "v*"
 
 env:
   CARGO_TERM_COLOR: always
-  # 显式告诉 Cargo 我们要构建 Intel 版本
-  # 虽然在 Intel 机器上这是默认值，但写上更保险
+  # 强制指定构建目标为 Intel 架构 (即使 Runner 是 ARM 的)
   CARGO_BUILD_TARGET: x86_64-apple-darwin
 
 jobs:
-  build-intel:
-    name: Build Intel Release
-    # 关键点：macos-13 是 GitHub Actions 目前提供的 x86_64 (Intel) 架构环境
-    # 不要使用 macos-latest (它是 ARM/M1 架构)
-    runs-on: macos-13
+  build-intel-on-arm:
+    name: Build Intel Release (Cross-compile)
+    # 使用最新的 macOS Runner (基于 Apple Silicon)
+    # 这样避免了 macos-13 的废弃警告，且编译速度通常更快
+    runs-on: macos-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Zed 的构建过程依赖 Node.js (用于处理 copilot/语言服务器等逻辑)
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -33,17 +31,25 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          # 关键：安装 Intel 架构的标准库
           targets: x86_64-apple-darwin
           components: rust-src
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      # 开始编译
-      - name: Build Release Binary
+      # 编译步骤
+      - name: Build Release Binary (Intel)
+        # --target 参数告诉 Rust：虽然我在 ARM 机器上，但请给我生成 Intel 的包
         run: cargo build --release --target x86_64-apple-darwin
 
-      # 手动打包步骤：模拟官方打包结构，但跳过签名
+      # 验证步骤 (可选，用于确认生成的文件格式正确)
+      - name: Verify Architecture
+        run: |
+          file target/x86_64-apple-darwin/release/zed
+          # 应该输出: Mach-O 64-bit executable x86_64
+
+      # 打包步骤
       - name: Create App Bundle
         run: |
           echo "Creating Zed.app structure..."
@@ -54,23 +60,21 @@ jobs:
           echo "Copying Binary..."
           cp target/x86_64-apple-darwin/release/zed "$APP_NAME/Contents/MacOS/zed"
 
-          echo "Copying Resources (Icons and Plist)..."
-          # 尝试从源码目录复制官方的图标和配置 (路径可能会随官方版本变动，这里使用常见路径)
-          # 如果源码里没有找到，脚本不会报错退出，保证你能拿到二进制
-          cp crates/zed/resources/app-icon.icns "$APP_NAME/Contents/Resources/" || echo "Icon not found, skipping"
-          cp crates/zed/resources/Info.plist "$APP_NAME/Contents/" || echo "Plist not found, skipping"
-
-          # 赋予可执行权限
+          echo "Copying Resources..."
+          # 尝试复制图标和 plist，如果找不到则忽略（不中断流程）
+          cp crates/zed/resources/app-icon.icns "$APP_NAME/Contents/Resources/" || echo "Icon not found"
+          cp crates/zed/resources/Info.plist "$APP_NAME/Contents/" || echo "Plist not found"
+          
+          # 确保 Plist 里没有特定于 ARM 的设置 (通常通用，但为了保险)
+          # 赋予执行权限
           chmod +x "$APP_NAME/Contents/MacOS/zed"
-
-          # 移除隔离属性 (虽然在 CI 环境可能没用，但为了保险)
+          
+          # 清除属性
           xattr -c "$APP_NAME" || true
 
-      # 创建 DMG 镜像 (使用 create-dmg 工具，比手动 zip 更像 Release 包)
       - name: Create DMG
         run: |
           npm install -g create-dmg
-          # 生成 Zed.dmg
           create-dmg \
             --overwrite \
             --volname "Zed" \
@@ -83,7 +87,6 @@ jobs:
             "Zed-Intel.dmg" \
             "Zed.app"
 
-      # 上传构建产物：同时上传 .app (zip) 和 .dmg
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
