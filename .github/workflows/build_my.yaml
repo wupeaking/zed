@@ -1,4 +1,4 @@
-name: Build Zed macOS (Intel)
+name: Build Zed macOS (Intel) + Remote Server
 
 on:
   workflow_dispatch:
@@ -8,16 +8,62 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_BUILD_TARGET: x86_64-apple-darwin
+  # 显式告诉 Zed 这是一个 Release 版本，不要使用开发环境路径
+  ZED_UPDATE_CHANNEL: stable
 
 jobs:
-  build-intel-on-arm:
-    name: Build Intel Release (Cross-compile)
+  # --- 第一步：编译 Linux 版本的远程服务 (Remote Server) ---
+  build-linux-server:
+    name: Build Remote Server (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      # 编译 remote_server 包
+      - name: Build Remote Server
+        run: cargo build --release -p remote_server
+
+      # 官方逻辑通常需要 gzip 压缩
+      - name: Compress Server Binary
+        run: |
+          cp target/release/remote_server zed-remote-server-linux-x86_64
+          gzip -f zed-remote-server-linux-x86_64
+
+      # 上传构建好的 Linux 服务端供下一步使用
+      - name: Upload Linux Server Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-server-linux
+          path: zed-remote-server-linux-x86_64.gz
+
+  # --- 第二步：编译 macOS 客户端并打包 ---
+  build-macos-client:
+    name: Build macOS Client (Intel)
+    needs: build-linux-server  # 必须等 Linux 服务端编好
     runs-on: macos-latest
+
+    env:
+      CARGO_BUILD_TARGET: x86_64-apple-darwin
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # 下载上一步编译好的 Linux 服务端
+      - name: Download Linux Server
+        uses: actions/download-artifact@v4
+        with:
+          name: remote-server-linux
+          path: resources_prebuild
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -39,7 +85,7 @@ jobs:
       - name: Build Release Binary (Intel)
         run: cargo build --release --target x86_64-apple-darwin
 
-      # [重点修改] 动态查找图标 + 手动生成 Info.plist
+      # --- 手动打包流程 (加入远程服务端) ---
       - name: Create App Bundle
         run: |
           APP_NAME="Zed.app"
@@ -47,22 +93,24 @@ jobs:
           mkdir -p "$APP_NAME/Contents/MacOS"
           mkdir -p "$APP_NAME/Contents/Resources"
 
-          echo "Copying Binary..."
+          echo "Copying Main Binary..."
           cp target/x86_64-apple-darwin/release/zed "$APP_NAME/Contents/MacOS/zed"
           chmod +x "$APP_NAME/Contents/MacOS/zed"
 
+          echo "Copying Remote Server (Linux)..."
+          # 关键修复：将下载的 Linux server 放入 Resources 目录
+          # 注意：Zed 通常期望文件名包含架构信息，这里我们直接放入
+          cp resources_prebuild/zed-remote-server-linux-x86_64.gz "$APP_NAME/Contents/Resources/"
+
           echo "Searching for Icon..."
-          # 使用 find 命令在当前目录下查找 app-icon.icns，取第一个找到的结果
           ICON_PATH=$(find . -name "app-icon.icns" -print -quit)
           if [ -n "$ICON_PATH" ]; then
-            echo "Found icon at: $ICON_PATH"
             cp "$ICON_PATH" "$APP_NAME/Contents/Resources/app-icon.icns"
           else
-            echo "WARNING: Icon not found! The app will have a generic icon."
+            echo "WARNING: Icon not found"
           fi
 
           echo "Generating Info.plist..."
-          # 手动写入一个最小化标准 Info.plist，保证 App 可识别
           cat > "$APP_NAME/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -88,12 +136,10 @@ jobs:
           </plist>
           EOF
 
-          # 清除可能存在的隔离属性
           xattr -c "$APP_NAME" || true
 
       - name: Create DMG
         run: |
-          # 使用系统自带 hdiutil，无需安装任何 npm 包
           hdiutil create -volname "Zed" -srcfolder "Zed.app" -ov -format UDZO "Zed-Intel.dmg"
 
       - name: Upload Artifacts
